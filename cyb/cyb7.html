@@ -1,0 +1,278 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Hand Controlled Particle Vortex</title>
+
+<style>
+body { margin: 0; overflow: hidden; background:#111; }
+#canvas-container { position:fixed; inset:0; }
+#webcam {
+  position:fixed;
+  bottom:10px;
+  right:10px;
+  width:160px;
+  height:120px;
+  opacity:.7;
+  transform:scaleX(-1);
+  border-radius:8px;
+}
+#loading {
+  position:fixed;
+  inset:0;
+  display:flex;
+  align-items:center;
+  justify-content:center;
+  color:white;
+  font-family:sans-serif;
+  z-index:10;
+}
+</style>
+</head>
+
+<body>
+<div id="loading">Initializing Camera & AI…</div>
+<video id="webcam" autoplay playsinline muted></video>
+<div id="canvas-container"></div>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+    "@mediapipe/tasks-vision": "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.8/+esm"
+  }
+}
+</script>
+
+<script type="module">
+import * as THREE from "three";
+import { FilesetResolver, HandLandmarker } from "@mediapipe/tasks-vision";
+
+/* ================= CONFIG ================= */
+const IMAGE_URL = "cesarybarbara.jpeg";
+const PARTICLE_SIZE = 4;
+
+/* ================= GLOBALS ================= */
+let scene, camera, renderer, particlesMesh;
+let originalPositions = [];
+let randomPositions = [];
+let handLandmarker, webcam;
+let lastVideoTime = -1;
+
+let currentExplosionFactor = 0;
+let targetExplosionFactor = 0;
+
+let handForces = [];
+let previousHandAngle = null;
+let vortexStrength = 0;
+
+/* ================= INIT ================= */
+async function init() {
+  webcam = document.getElementById("webcam");
+
+  scene = new THREE.Scene();
+  camera = new THREE.PerspectiveCamera(75, innerWidth/innerHeight, 0.1, 1000);
+  camera.position.z = 220;
+
+  renderer = new THREE.WebGLRenderer({ antialias:true, alpha:true });
+  renderer.setSize(innerWidth, innerHeight);
+  renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+  document.getElementById("canvas-container").appendChild(renderer.domElement);
+
+  await createParticlesFromImage(IMAGE_URL);
+  await initHandTracking();
+
+  document.getElementById("loading").style.display = "none";
+  animate();
+}
+
+/* ================= PARTICLES ================= */
+function createParticlesFromImage(url) {
+  return new Promise(resolve => {
+    const img = new Image();
+    img.crossOrigin = "anonymous";
+    img.src = url;
+
+    img.onload = () => {
+      const c = document.createElement("canvas");
+      const ctx = c.getContext("2d");
+
+      const w = 200;
+      const h = w * (img.height / img.width);
+      c.width = w;
+      c.height = h;
+      ctx.drawImage(img, 0, 0, w, h);
+
+      const data = ctx.getImageData(0,0,w,h).data;
+      const pos = [];
+      const col = [];
+
+      for(let y=0;y<h;y++){
+        for(let x=0;x<w;x++){
+          const i = (y*w+x)*4;
+          if(data[i+3]>128){
+            const px = x - w/2;
+            const py = -(y - h/2);
+            const pz = 0;
+
+            originalPositions.push(px,py,pz);
+            randomPositions.push(
+              (Math.random()-0.5)*500,
+              (Math.random()-0.5)*500,
+              (Math.random()-0.5)*500
+            );
+
+            pos.push(px,py,pz);
+            col.push(data[i]/255,data[i+1]/255,data[i+2]/255);
+          }
+        }
+      }
+
+      const geo = new THREE.BufferGeometry();
+      geo.setAttribute("position", new THREE.Float32BufferAttribute(pos,3));
+      geo.setAttribute("color", new THREE.Float32BufferAttribute(col,3));
+
+      const mat = new THREE.PointsMaterial({
+        size: PARTICLE_SIZE,
+        vertexColors:true,
+        transparent:true,
+        opacity:.9
+      });
+
+      particlesMesh = new THREE.Points(geo,mat);
+      scene.add(particlesMesh);
+      resolve();
+    };
+  });
+}
+
+/* ================= HAND TRACKING ================= */
+async function initHandTracking() {
+  const vision = await FilesetResolver.forVisionTasks(
+    "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.8/wasm"
+  );
+
+  handLandmarker = await HandLandmarker.createFromOptions(vision,{
+    baseOptions:{
+      modelAssetPath:
+      "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task",
+      delegate:"GPU"
+    },
+    runningMode:"VIDEO",
+    numHands:2
+  });
+
+  const stream = await navigator.mediaDevices.getUserMedia({video:true});
+  webcam.srcObject = stream;
+  await webcam.play();
+}
+
+/* ================= HAND TENSION ================= */
+function calculateHandTension(lm){
+  const thumb = lm[4];
+  const index = lm[8];
+  const wrist = lm[0];
+  const base = lm[5];
+
+  const pinch = Math.hypot(thumb.x-index.x, thumb.y-index.y);
+  const size = Math.hypot(wrist.x-base.x, wrist.y-base.y);
+
+  return THREE.MathUtils.clamp(pinch/(size*0.3),0,1);
+}
+
+/* ================= LOOP ================= */
+function animate(){
+  requestAnimationFrame(animate);
+
+  if(handLandmarker && webcam.currentTime !== lastVideoTime){
+    lastVideoTime = webcam.currentTime;
+    const res = handLandmarker.detectForVideo(webcam, Date.now());
+
+    handForces = [];
+    vortexStrength = 0;
+
+    if(res.landmarks?.length){
+      let tension = 0;
+
+      res.landmarks.forEach((lm,i)=>{
+        tension += calculateHandTension(lm);
+
+        const w = lm[0];
+        handForces.push({
+          x:(w.x-0.5)*300,
+          y:-(w.y-0.5)*300,
+          polarity: i===0 ? 1 : -1
+        });
+      });
+
+      targetExplosionFactor = tension / res.landmarks.length;
+
+      const lm = res.landmarks[0];
+      const w = lm[0], idx = lm[8];
+      const ang = Math.atan2(idx.y-w.y, idx.x-w.x);
+
+      if(previousHandAngle!==null){
+        let d = ang - previousHandAngle;
+        if(d>Math.PI) d-=Math.PI*2;
+        if(d<-Math.PI) d+=Math.PI*2;
+        vortexStrength = THREE.MathUtils.clamp(d*5,-1,1);
+      }
+      previousHandAngle = ang;
+    } else {
+      targetExplosionFactor = 0;
+      previousHandAngle = null;
+    }
+  }
+
+  currentExplosionFactor += (targetExplosionFactor-currentExplosionFactor)*0.08;
+
+  const pos = particlesMesh.geometry.attributes.position.array;
+
+  for(let i=0;i<pos.length;i+=3){
+    let ox = originalPositions[i];
+    let oy = originalPositions[i+1];
+    let oz = originalPositions[i+2];
+
+    let rx = randomPositions[i];
+    let ry = randomPositions[i+1];
+    let rz = randomPositions[i+2];
+
+    let px = ox + (rx-ox)*currentExplosionFactor;
+    let py = oy + (ry-oy)*currentExplosionFactor;
+    let pz = oz + (rz-oz)*currentExplosionFactor;
+
+    handForces.forEach(h=>{
+      const dx = h.x-px;
+      const dy = h.y-py;
+      const d = Math.hypot(dx,dy)+0.001;
+
+      const f = h.polarity*30/d;
+      px += (dx/d)*f*currentExplosionFactor;
+      py += (dy/d)*f*currentExplosionFactor;
+
+      const tx = -dy/d;
+      const ty = dx/d;
+      px += tx*vortexStrength*10*currentExplosionFactor;
+      py += ty*vortexStrength*10*currentExplosionFactor;
+    });
+
+    pos[i]=px; pos[i+1]=py; pos[i+2]=pz;
+  }
+
+  particlesMesh.geometry.attributes.position.needsUpdate = true;
+  particlesMesh.rotation.y += 0.002;
+
+  renderer.render(scene,camera);
+}
+
+window.addEventListener("resize",()=>{
+  camera.aspect = innerWidth/innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth,innerHeight);
+});
+
+init();
+</script>
+</body>
+</html>
