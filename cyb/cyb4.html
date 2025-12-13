@@ -1,0 +1,395 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Particle Image Interaction (Cesary y Barbara)</title>
+    <style>
+        body { margin: 0; overflow: hidden; background-color: #050505; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; }
+        
+        /* Oculta el video de entrada y la imagen de origen */
+        #input_video, #source_image, #pixel_canvas { display: none; }
+        
+        /* Three.js Canvas */
+        #output_canvas {
+            position: absolute;
+            top: 0; left: 0;
+            width: 100vw; height: 100vh;
+            z-index: 1;
+        }
+
+        /* Indicador de estado para Android/Móvil */
+        #status-overlay {
+            position: absolute;
+            top: 20px;
+            left: 50%;
+            transform: translateX(-50%);
+            padding: 10px 20px;
+            background: rgba(0, 0, 0, 0.5);
+            border-radius: 8px;
+            color: white;
+            z-index: 10;
+            font-size: 0.9rem;
+            text-align: center;
+        }
+        
+        .dot { width: 8px; height: 8px; border-radius: 50%; background: #ff4444; display: inline-block; margin-right: 8px; }
+        .dot.active { background: #00ff88; box-shadow: 0 0 8px #00ff88; }
+
+    </style>
+    
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+</head>
+<body>
+
+    <video id="input_video"></video>
+    <canvas id="output_canvas"></canvas>
+    
+    <img id="source_image" src="cesarybarbara.jpeg" alt="Source Image">
+    <canvas id="pixel_canvas"></canvas>
+
+    <div id="status-overlay">
+        <div class="dot" id="statusDot"></div>
+        <span id="statusText">Cargando imagen...</span>
+    </div>
+
+<script>
+    // --- 1. Three.js Setup & Constants ---
+    const scene = new THREE.Scene();
+    scene.fog = new THREE.FogExp2(0x050505, 0.002);
+
+    const camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+    camera.position.z = 50; // Aumentar la distancia para ver toda la imagen
+
+    const renderer = new THREE.WebGLRenderer({ canvas: document.getElementById('output_canvas'), alpha: true, antialias: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setPixelRatio(window.devicePixelRatio);
+
+    const IMAGE_URL = 'cesarybarbara.jpeg'; // La foto adjunta
+    const TARGET_SIZE = 120; // Tamaño base del sistema de partículas en unidades 3D (para que quepa en la vista)
+    const PARTICLE_COUNT = 80000; // Aumentar las partículas para una imagen detallada
+
+    let particles;
+    let originalPositions; // Posición de la imagen (target)
+    let particleColors; // Color del píxel
+    let positionsAttr;
+    let colorAttr;
+
+    // --- 2. Image and Pixel Extraction ---
+    
+    function loadAndProcessImage() {
+        return new Promise((resolve, reject) => {
+            const img = document.getElementById('source_image');
+            const canvas = document.getElementById('pixel_canvas');
+            const ctx = canvas.getContext('2d');
+            
+            // Asegúrate de que la imagen está cargada
+            if (!img.complete) {
+                img.onload = () => processImage(img, canvas, ctx, resolve);
+                img.onerror = reject;
+            } else {
+                processImage(img, canvas, ctx, resolve);
+            }
+        });
+    }
+
+    function processImage(img, canvas, ctx, resolve) {
+        const imgWidth = img.naturalWidth;
+        const imgHeight = img.naturalHeight;
+        
+        // El canvas de extracción debe tener el tamaño original de la imagen
+        canvas.width = imgWidth;
+        canvas.height = imgHeight;
+        ctx.drawImage(img, 0, 0, imgWidth, imgHeight);
+
+        const imageData = ctx.getImageData(0, 0, imgWidth, imgHeight);
+        const data = imageData.data;
+        
+        const positions = new Float32Array(PARTICLE_COUNT * 3);
+        const colors = new Float32Array(PARTICLE_COUNT * 3);
+        const sizes = new Float32Array(PARTICLE_COUNT);
+
+        let activePixels = [];
+        
+        // 1. Recopilar solo píxeles no transparentes (o no completamente negros, si es una foto)
+        for (let i = 0; i < imgWidth * imgHeight; i++) {
+            const i4 = i * 4;
+            const r = data[i4];
+            const g = data[i4 + 1];
+            const b = data[i4 + 2];
+            // Si el color no es casi negro, considéralo un píxel activo
+            if (r + g + b > 10) { 
+                activePixels.push({
+                    x: (i % imgWidth),
+                    y: Math.floor(i / imgWidth),
+                    r: r / 255, 
+                    g: g / 255, 
+                    b: b / 255
+                });
+            }
+        }
+        
+        const activeCount = activePixels.length;
+        const step = Math.max(1, Math.floor(activeCount / PARTICLE_COUNT)); // Salto para muestrear la imagen
+        let particleIndex = 0;
+        
+        // 2. Asignar posiciones y colores a las partículas
+        for (let i = 0; i < activeCount && particleIndex < PARTICLE_COUNT; i += step) {
+            const pixel = activePixels[i];
+            const i3 = particleIndex * 3;
+            
+            // Mapear coordenadas de píxeles a coordenadas 3D centradas
+            // La imagen se ajustará al ancho TARGET_SIZE.
+            const scaleFactor = TARGET_SIZE / imgWidth;
+            const offsetX = (imgWidth / 2);
+            const offsetY = (imgHeight / 2);
+            
+            // Posición (Y invertida para que la imagen no esté cabeza abajo)
+            positions[i3] = (pixel.x - offsetX) * scaleFactor;
+            positions[i3 + 1] = -(pixel.y - offsetY) * scaleFactor; 
+            positions[i3 + 2] = (Math.random() - 0.5) * 0.1; // Profundidad ligera
+
+            // Color del píxel
+            colors[i3] = pixel.r;
+            colors[i3 + 1] = pixel.g;
+            colors[i3 + 2] = pixel.b;
+
+            // Tamaño aleatorio para variar
+            sizes[particleIndex] = 0.5 + Math.random();
+            
+            particleIndex++;
+        }
+        
+        // Actualiza el conteo real de partículas si no es el máximo
+        const finalParticleCount = particleIndex;
+
+        // Truncar si es necesario (aunque el loop ya lo controla)
+        const finalPositions = positions.slice(0, finalParticleCount * 3);
+        const finalColors = colors.slice(0, finalParticleCount * 3);
+        const finalSizes = sizes.slice(0, finalParticleCount);
+
+        // Almacena las posiciones finales como posición original (target)
+        originalPositions = finalPositions; 
+
+        resolve({ positions: finalPositions, colors: finalColors, sizes: finalSizes, count: finalParticleCount });
+    }
+
+    function initParticleSystem({ positions, colors, sizes, count }) {
+        // Crear Geometría
+        const geometry = new THREE.BufferGeometry();
+        positionsAttr = new THREE.BufferAttribute(positions, 3);
+        colorAttr = new THREE.BufferAttribute(colors, 3);
+        geometry.setAttribute('position', positionsAttr);
+        geometry.setAttribute('color', colorAttr);
+        geometry.setAttribute('size', new THREE.BufferAttribute(sizes, 1));
+
+        // Crear Material
+        // Usar VertexColors para el color de los píxeles
+        const material = new THREE.PointsMaterial({
+            size: 0.8, // Ajustar el tamaño del punto
+            vertexColors: true, 
+            map: createTexture(),
+            blending: THREE.AdditiveBlending,
+            depthWrite: false,
+            transparent: true,
+            opacity: 1.0 // Opacidad total ya que estamos usando los colores de los píxeles
+        });
+        
+        particles = new THREE.Points(geometry, material);
+        scene.add(particles);
+
+        // Inicializa la posición actual de las partículas lejos de su destino (para el efecto de condensación inicial)
+        const currentPositions = positionsAttr.array;
+        for (let i = 0; i < currentPositions.length; i++) {
+            currentPositions[i] = (Math.random() - 0.5) * 80;
+        }
+        positionsAttr.needsUpdate = true;
+    }
+
+    // Genera una textura de brillo
+    function createTexture() {
+        const canvas = document.createElement('canvas');
+        canvas.width = 32; canvas.height = 32;
+        const ctx = canvas.getContext('2d');
+        const grad = ctx.createRadialGradient(16, 16, 0, 16, 16, 16);
+        grad.addColorStop(0, 'rgba(255,255,255,1)');
+        grad.addColorStop(0.5, 'rgba(255,255,255,0.5)');
+        grad.addColorStop(1, 'rgba(255,255,255,0)');
+        ctx.fillStyle = grad;
+        ctx.fillRect(0, 0, 32, 32);
+        const texture = new THREE.Texture(canvas);
+        texture.needsUpdate = true;
+        return texture;
+    }
+
+
+    // --- 3. MediaPipe Hand Tracking Setup (Mantenido) ---
+    const videoElement = document.getElementById('input_video');
+    const statusDot = document.getElementById('statusDot');
+    const statusText = document.getElementById('statusText');
+    
+    // Variables de estado de interacción manual
+    let handInteraction = {
+        detected: false,
+        openness: 0.0, // 0 = fist (condense), 1 = open (expand)
+        centerX: 0,
+        centerY: 0,
+    };
+
+    function onResults(results) {
+        if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
+            handInteraction.detected = true;
+            statusDot.classList.add('active');
+            statusText.innerText = "Manos detectadas: • Mano Abierta: Expandir • Puño: Condensar";
+
+            const landmarks = results.multiHandLandmarks[0];
+            
+            // Distancia del dedo medio (12) a la muñeca (0) para la apertura
+            const wrist = landmarks[0];
+            const middleTip = landmarks[12];
+            
+            const dx = middleTip.x - wrist.x;
+            const dy = middleTip.y - wrist.y;
+            const dist = Math.sqrt(dx*dx + dy*dy);
+            
+            // Aproximación de la apertura: Puño ~0.2, Abierto ~0.5+
+            let openness = (dist - 0.2) * 3.5; 
+            handInteraction.openness = Math.max(0, Math.min(1, openness));
+
+            // Posición central del nudillo (9) mapeada a coordenadas 3D. Invertir X.
+            handInteraction.centerX = -(landmarks[9].x - 0.5) * 40; 
+            handInteraction.centerY = -(landmarks[9].y - 0.5) * 30;
+
+        } else {
+            handInteraction.detected = false;
+            statusDot.classList.remove('active');
+            statusText.innerText = "Muestra tus manos a la cámara para interactuar";
+            
+            // Vuelve a un estado neutro si se pierde la mano
+            handInteraction.openness += (0.0 - handInteraction.openness) * 0.05;
+        }
+    }
+
+    const hands = new Hands({locateFile: (file) => {
+        return `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`;
+    }});
+
+    hands.setOptions({
+        maxNumHands: 1, // Una mano es suficiente para los gestos
+        modelComplexity: 1,
+        minDetectionConfidence: 0.5,
+        minTrackingConfidence: 0.5
+    });
+
+    hands.onResults(onResults);
+
+    // Usa CameraUtils de MediaPipe (compatible con Android)
+    const cameraUtils = new Camera(videoElement, {
+        onFrame: async () => {
+            await hands.send({image: videoElement});
+        },
+        width: 640,
+        height: 480
+    });
+    // Inicia la cámara después de cargar la imagen
+    loadAndProcessImage().then(data => {
+        initParticleSystem(data);
+        cameraUtils.start();
+        animate();
+        statusText.innerText = "Cargado. ¡Muestra tus manos!";
+    }).catch(error => {
+        statusText.innerText = "Error cargando la imagen: " + error;
+        console.error("Error loading or processing image:", error);
+    });
+
+    // --- 4. Animation Loop & Interactions ---
+    const clock = new THREE.Clock();
+
+    function animate() {
+        requestAnimationFrame(animate);
+
+        if (!particles || !originalPositions) return;
+
+        const time = clock.getElapsedTime();
+        const array = positionsAttr.array;
+        const count = positionsAttr.count;
+
+        // Factor de expansión/contracción (controlado por la apertura de la mano)
+        // 0.0 (Puño) = Contracción a la forma original
+        // 1.0 (Mano Abierta) = Expansión
+        const expansionFactor = 1.0 - handInteraction.openness; // 1.0 cuando es Puño, 0.0 cuando está Abierta
+        const targetScale = 1.0 + (1 - expansionFactor) * 0.3; // Escala ligera de expansión al abrir la mano
+        
+        // Mapear el factor de expansión a la constante de condensación/expansión
+        const condenseScale = 0.0 + expansionFactor * 30; // Distancia desde el centro (0) cuando es Puño
+
+        // Velocidad de interpolación
+        const lerpSpeed = 0.06 + handInteraction.openness * 0.05;
+
+        // Actualiza cada partícula
+        for (let i = 0; i < count; i++) {
+            const i3 = i * 3;
+
+            const ox = originalPositions[i3];
+            const oy = originalPositions[i3+1];
+            const oz = originalPositions[i3+2];
+            
+            let targetX, targetY, targetZ;
+
+            if (handInteraction.detected && expansionFactor > 0.05) {
+                // Gesto de Puño (Condensar)
+                // Se mueven hacia el centro de la mano (posición de la mano)
+                const condenseFactor = Math.random() * condenseScale;
+                targetX = handInteraction.centerX + (ox / TARGET_SIZE) * condenseFactor;
+                targetY = handInteraction.centerY + (oy / TARGET_SIZE) * condenseFactor;
+                targetZ = 0;
+
+            } else {
+                // Gesto de Mano Abierta (Expandir) o No Detectado (Vuelve a la forma)
+                targetX = ox * targetScale;
+                targetY = oy * targetScale;
+                targetZ = oz * targetScale;
+                
+                // Si la mano está detectada, se mueve el centro de la imagen hacia la mano
+                if (handInteraction.detected) {
+                    targetX += handInteraction.centerX;
+                    targetY += handInteraction.centerY;
+                }
+            }
+
+            // Aplicar el ruido de movimiento ligero (opcional)
+            // targetX += Math.sin(time * 0.5 + i) * 0.1;
+            // targetY += Math.cos(time * 0.5 + i * 0.5) * 0.1;
+
+            // Interpolación de posición
+            array[i3] += (targetX - array[i3]) * lerpSpeed;
+            array[i3+1] += (targetY - array[i3+1]) * lerpSpeed;
+            array[i3+2] += (targetZ - array[i3+2]) * lerpSpeed;
+        }
+
+        positionsAttr.needsUpdate = true;
+
+        // Rotación general si no hay interacción
+        if (!handInteraction.detected) {
+            particles.rotation.y += 0.0005;
+        } else {
+            // Rotación basada en la posición de la mano
+            particles.rotation.y = handInteraction.centerX * 0.005;
+            particles.rotation.x = handInteraction.centerY * 0.005;
+        }
+
+        renderer.render(scene, camera);
+    }
+
+    // Manejador de redimensionamiento
+    window.addEventListener('resize', () => {
+        camera.aspect = window.innerWidth / window.innerHeight;
+        camera.updateProjectionMatrix();
+        renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+
+</script>
+</body>
+</html>
