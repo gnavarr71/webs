@@ -1,0 +1,227 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <title>Physics Particle System: Gestures</title>
+    <style>
+        body { margin: 0; overflow: hidden; background-color: #111; font-family: sans-serif; }
+        #canvas-container { position: absolute; top: 0; left: 0; width: 100vw; height: 100vh; z-index: 1; }
+        /* Mirrored webcam preview */
+        #webcam { position: absolute; bottom: 10px; right: 10px; width: 160px; height: 120px; z-index: 2; border-radius: 8px; transform: scaleX(-1); opacity: 0.7; pointer-events: none;}
+        #loading { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); color: white; z-index: 10; font-size: 1.2rem; text-align: center; pointer-events: none;}
+        #instructions { position: absolute; top: 20px; width: 100%; text-align: center; color: rgba(255,255,255,0.8); z-index: 5; pointer-events: none; font-weight: bold; text-shadow: 0 1px 3px rgba(0,0,0,0.5);}
+        .sub-instruct { font-weight: normal; font-size: 0.9rem; opacity: 0.8; }
+    </style>
+</head>
+<body>
+
+    <div id="loading">Initialize Camera & Physics...</div>
+    <div id="instructions">
+        FIST: Condense • OPEN HAND: Explode
+        <div class="sub-instruct">Move open hand to direct particles</div>
+    </div>
+    <video id="webcam" autoplay playsinline muted></video>
+    <div id="canvas-container"></div>
+
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+                "@mediapipe/tasks-vision": "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.8/+esm"
+            }
+        }
+    </script>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { FilesetResolver, HandLandmarker } from '@mediapipe/tasks-vision';
+
+        // --- Configuration ---
+        const IMAGE_URL = 'cesarybarbara.jpeg'; 
+        const PARTICLE_SIZE = 3.5;
+        const CAMERA_Z = 300;
+        
+        // Physics Config
+        const FRICTION = 0.92; // Dampening to stop particles flying off forever
+        const SPRING_STRENGTH = 0.02; // Force pulling back to original image position
+        const REPULSION_STRENGTH = 3000; // Force pushing away from open hand
+        const REPULSION_RADIUS = 150; // Max distance hand affects particles
+
+        // --- Globals ---
+        let scene, camera, renderer, particlesMesh;
+        // We need standard JS arrays for physics calculations before updating buffers
+        let originalPositions = []; 
+        let currentPositions = [];
+        let velocities = [];
+
+        let handLandmarker = undefined;
+        let webcamElement = document.getElementById('webcam');
+        
+        // Interaction State
+        let isHandDetected = false;
+        let isHandOpen = false; // false = fist, true = open
+        let handPos3D = new THREE.Vector3(0, 0, 0);
+        let smoothedHandPos3D = new THREE.Vector3(0, 0, 0);
+
+        // --- 1. Initialization ---
+        async function init() {
+            const container = document.getElementById('canvas-container');
+            scene = new THREE.Scene();
+            // Adjust FOV slightly for better mobile view
+            camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 2000);
+            camera.position.z = CAMERA_Z;
+
+            renderer = new THREE.WebGLRenderer({ antialias: false, alpha: true, powerPreference: "high-performance" });
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2)); 
+            container.appendChild(renderer.domElement);
+
+            await createParticlesFromImage(IMAGE_URL);
+            await initHandTracking();
+            
+            document.getElementById('loading').style.display = 'none';
+            animate();
+        }
+
+        // --- 2. Image Processing & Particle Setup ---
+        function createParticlesFromImage(url) {
+            return new Promise((resolve) => {
+                const img = new Image();
+                img.crossOrigin = "Anonymous";
+                img.src = url;
+                img.onload = () => {
+                    const canvas = document.createElement('canvas');
+                    const ctx = canvas.getContext('2d');
+                    const aspectRatio = img.height / img.width;
+                    // Slightly lower resolution for physics performance on mobile
+                    const width = 180; 
+                    const height = width * aspectRatio;
+                    
+                    canvas.width = width;
+                    canvas.height = height;
+                    ctx.drawImage(img, 0, 0, width, height);
+                    
+                    const imgData = ctx.getImageData(0, 0, width, height);
+                    const data = imgData.data;
+
+                    const colArray = []; // For GPU Buffer
+
+                    for (let y = 0; y < height; y++) {
+                        for (let x = 0; x < width; x++) {
+                            const i = (y * width + x) * 4;
+                            const alpha = data[i + 3];
+
+                            if (alpha > 100) {
+                                const pX = (x - width / 2) * 1.5; // Spread them out a bit
+                                const pY = -(y - height / 2) * 1.5;
+                                const pZ = 0;
+
+                                // Store original targets
+                                originalPositions.push(pX, pY, pZ);
+                                // Initialize current positions
+                                currentPositions.push(pX, pY, pZ);
+                                // Initialize velocities at 0
+                                velocities.push(0, 0, 0);
+                                
+                                // Colors (normalized 0-1)
+                                colArray.push(data[i]/255, data[i+1]/255, data[i+2]/255);
+                            }
+                        }
+                    }
+
+                    // Create Geometry
+                    const geometry = new THREE.BufferGeometry();
+                    // We only need to set colors once
+                    geometry.setAttribute('color', new THREE.Float32BufferAttribute(colArray, 3));
+                    // Position attribute will be updated every frame from currentPositions array
+                    geometry.setAttribute('position', new THREE.Float32BufferAttribute(currentPositions, 3));
+                    
+                    const material = new THREE.PointsMaterial({
+                        size: PARTICLE_SIZE,
+                        vertexColors: true,
+                        transparent: true,
+                        opacity: 0.9,
+                        // depthTest: false, // Optional: creates a different blending look
+                        blending: THREE.AdditiveBlending
+                    });
+
+                    particlesMesh = new THREE.Points(geometry, material);
+                    scene.add(particlesMesh);
+                    resolve();
+                };
+            });
+        }
+
+        // --- 3. Hand Tracking ---
+        async function initHandTracking() {
+            const vision = await FilesetResolver.forVisionTasks(
+                "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.8/wasm"
+            );
+            handLandmarker = await HandLandmarker.createFromOptions(vision, {
+                baseOptions: {
+                    modelAssetPath: `https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task`,
+                    delegate: "GPU"
+                },
+                runningMode: "VIDEO",
+                numHands: 1
+            });
+
+            if (navigator.mediaDevices?.getUserMedia) {
+                const stream = await navigator.mediaDevices.getUserMedia({ 
+                    video: { facingMode: "user", width: 640, height: 480 } 
+                });
+                webcamElement.srcObject = stream;
+                await new Promise(r => webcamElement.onloadedmetadata = () => {
+                    webcamElement.play();
+                    r();
+                });
+            }
+        }
+
+        // --- 4. Animation & Physics Loop ---
+        let lastVideoTime = -1;
+        
+        function animate() {
+            requestAnimationFrame(animate);
+
+            // --- A. Hand Detection Logic ---
+            if (handLandmarker && webcamElement.currentTime !== lastVideoTime) {
+                lastVideoTime = webcamElement.currentTime;
+                const results = handLandmarker.detectForVideo(webcamElement, Date.now());
+
+                if (results.landmarks && results.landmarks.length > 0) {
+                    isHandDetected = true;
+                    const landmarks = results.landmarks[0];
+
+                    // 1. Determine Fist vs Open (using pinch distance normalized by hand size)
+                    const thumbTip = landmarks[4];
+                    const indexTip = landmarks[8];
+                    const wrist = landmarks[0];
+                    const indexBase = landmarks[5];
+
+                    const pinchDist = Math.hypot(thumbTip.x - indexTip.x, thumbTip.y - indexTip.y);
+                    const handSize = Math.hypot(wrist.x - indexBase.x, wrist.y - indexBase.y);
+                    // Threshold: If pinch distance is less than 40% of hand size -> Fist
+                    isHandOpen = (pinchDist / handSize) > 0.4;
+
+                    // 2. Map 2D Hand Position to 3D Scene Space
+                    // Use wrist (0) or middle finger knuckle (9) as center point
+                    const handCenterX = landmarks[9].x;
+                    const handCenterY = landmarks[9].y;
+
+                    // Calculate visible height at Z=0 based on camera FOV and distance
+                    const vFOV = THREE.MathUtils.degToRad(camera.fov);
+                    const visibleHeight = 2 * Math.tan(vFOV / 2) * CAMERA_Z;
+                    const visibleWidth = visibleHeight * camera.aspect;
+
+                    // Map normalized (0..1) coordinates to 3D space coordinates. 
+                    // X is mirrored (1.0 - x). Y is flipped (0 is top in 2D, positive in 3D).
+                    handPos3D.x = ((1.0 - handCenterX) - 0.5) * visibleWidth;
+                    handPos3D.y = -(handCenterY - 0.5) * visibleHeight;
+                    // Keep Z at 0 for interaction plane
+                    handPos3D.z = 0;
+
+                } else {
+                    isHandDetected = false;
+                    // If
