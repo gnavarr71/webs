@@ -1,0 +1,485 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <title>AR Gesture Shooter</title>
+    <style>
+        body { margin: 0; padding: 0; overflow: hidden; background-color: #000; font-family: 'Courier New', Courier, monospace; }
+        
+        /* Video is hidden, we render it or just use canvas on top */
+        #input_video { display: none; }
+        
+        /* Main Game Canvas */
+        #output_canvas { 
+            position: absolute; 
+            top: 0; left: 0; 
+            width: 100%; height: 100%; 
+            z-index: 1;
+            transform: scaleX(-1); /* Mirror effect for natural AR feel */
+        }
+
+        /* UI Layer (Not mirrored) */
+        #ui_layer {
+            position: absolute;
+            top: 0; left: 0;
+            width: 100%; height: 100%;
+            z-index: 2;
+            pointer-events: none;
+        }
+
+        /* Loading Screen */
+        #loading_screen {
+            position: absolute;
+            top: 0; left: 0;
+            width: 100%; height: 100%;
+            background: #111;
+            z-index: 10;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+            color: #0f0;
+            font-size: 24px;
+            font-weight: bold;
+            transition: opacity 0.5s;
+        }
+        .loader {
+            border: 4px solid #333;
+            border-top: 4px solid #0f0;
+            border-radius: 50%;
+            width: 40px; height: 40px;
+            animation: spin 1s linear infinite;
+            margin-bottom: 20px;
+        }
+        @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+
+        /* Floating Text */
+        .float-text {
+            position: absolute;
+            font-weight: 900;
+            font-size: 30px;
+            animation: floatUp 1s forwards;
+            text-shadow: 2px 2px 0 #000;
+        }
+        .hit-text { color: #ffff00; }
+        .miss-text { color: #ff0000; font-size: 20px; }
+
+        @keyframes floatUp {
+            0% { transform: translateY(0) scale(1); opacity: 1; }
+            100% { transform: translateY(-100px) scale(1.5); opacity: 0; }
+        }
+
+        #debug_info {
+            position: absolute;
+            bottom: 10px; left: 10px;
+            color: white;
+            font-size: 12px;
+            background: rgba(0,0,0,0.5);
+            padding: 5px;
+        }
+    </style>
+    
+    <!-- Three.js -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <!-- MediaPipe Camera Utils -->
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js"></script>
+    <!-- MediaPipe Hands (Pinned Version) -->
+    <script src="https://unpkg.com/@mediapipe/hands@0.4.1646424915/hands.js" crossorigin="anonymous"></script>
+
+</head>
+<body>
+
+    <!-- Loading Overlay -->
+    <div id="loading_screen">
+        <div class="loader"></div>
+        <div id="loading_text">INITIALIZING AI...</div>
+        <div style="font-size: 12px; color: #888; margin-top: 10px;">Please allow camera access</div>
+    </div>
+
+    <video id="input_video" playsinline></video>
+    <canvas id="output_canvas"></canvas>
+    
+    <div id="ui_layer">
+        <div id="debug_info">Gesture: <span id="gesture_stat">None</span> | Enemies: <span id="enemy_stat">0</span></div>
+    </div>
+
+    <script>
+        /**
+         * CONFIGURATION & STATE
+         */
+        const CONFIG = {
+            mpVersion: '0.4.1646424915', // STRICT LOCK
+            maxEnemies: 4,
+            spawnDistance: 800, // Pixels from center
+            enemySpeed: 2.5,
+            aimAssistRadius: 100, // Pixels
+            triggerCooldown: 300, // ms
+            enemyImageSrc: "https://i.imgur.com/BNc074n.png" // The provided head image (hosted backup or use user prompt url)
+        };
+
+        // Use the image URL from the prompt context if the imgur link fails or for accuracy
+        const TARGET_IMG_URL = "https://i.imgur.com/BNc074n.png"; 
+
+        const state = {
+            isLoading: true,
+            lastShotTime: 0,
+            handPresent: false,
+            indexTip: { x: 0, y: 0 }, // Screen coords
+            thumbTip: { x: 0, y: 0 },
+            isTriggering: false,
+            score: 0
+        };
+
+        // DOM Elements
+        const canvasElement = document.getElementById('output_canvas');
+        const videoElement = document.getElementById('input_video');
+        const uiLayer = document.getElementById('ui_layer');
+        const loadingScreen = document.getElementById('loading_screen');
+        const debugStat = document.getElementById('gesture_stat');
+        
+        /**
+         * AUDIO SYSTEM (Synth - No external files)
+         */
+        const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        
+        function playSound(type) {
+            if (audioCtx.state === 'suspended') audioCtx.resume();
+            
+            const osc = audioCtx.createOscillator();
+            const gainNode = audioCtx.createGain();
+            osc.connect(gainNode);
+            gainNode.connect(audioCtx.destination);
+
+            if (type === 'shoot') {
+                osc.type = 'sawtooth';
+                osc.frequency.setValueAtTime(800, audioCtx.currentTime);
+                osc.frequency.exponentialRampToValueAtTime(100, audioCtx.currentTime + 0.1);
+                gainNode.gain.setValueAtTime(0.1, audioCtx.currentTime);
+                gainNode.gain.exponentialRampToValueAtTime(0.01, audioCtx.currentTime + 0.1);
+                osc.start();
+                osc.stop(audioCtx.currentTime + 0.1);
+            } else if (type === 'hit') {
+                osc.type = 'square';
+                osc.frequency.setValueAtTime(150, audioCtx.currentTime);
+                gainNode.gain.setValueAtTime(0.2, audioCtx.currentTime);
+                gainNode.gain.linearRampToValueAtTime(0, audioCtx.currentTime + 0.1);
+                osc.start();
+                osc.stop(audioCtx.currentTime + 0.1);
+            }
+        }
+
+        /**
+         * THREE.JS SETUP
+         */
+        const scene = new THREE.Scene();
+        // Orthographic camera for 2D Sprite HUD feel mapped to screen pixels
+        const camera = new THREE.OrthographicCamera(
+            window.innerWidth / -2, window.innerWidth / 2,
+            window.innerHeight / 2, window.innerHeight / -2,
+            1, 1000
+        );
+        camera.position.z = 10;
+
+        const renderer = new THREE.WebGLRenderer({ canvas: canvasElement, alpha: true, antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.setPixelRatio(window.devicePixelRatio);
+
+        // Resize handler
+        window.addEventListener('resize', () => {
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            camera.left = window.innerWidth / -2;
+            camera.right = window.innerWidth / 2;
+            camera.top = window.innerHeight / 2;
+            camera.bottom = window.innerHeight / -2;
+            camera.updateProjectionMatrix();
+        });
+
+        // Assets
+        const textureLoader = new THREE.TextureLoader();
+        const enemyTexture = textureLoader.load(TARGET_IMG_URL); 
+
+        // Game Objects
+        const enemies = [];
+        const crosshairGeo = new THREE.RingGeometry(15, 18, 32);
+        const crosshairMat = new THREE.MeshBasicMaterial({ color: 0x00ff00, transparent: true, opacity: 0.8 });
+        const crosshair = new THREE.Mesh(crosshairGeo, crosshairMat);
+        scene.add(crosshair);
+
+        // Laser Line
+        const laserMat = new THREE.LineBasicMaterial({ color: 0x00ff00, transparent: true, opacity: 0.5, linewidth: 2 });
+        const laserGeo = new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(0,0,0), new THREE.Vector3(0,0,0)]);
+        const laserLine = new THREE.Line(laserGeo, laserMat);
+        scene.add(laserLine);
+
+        /**
+         * GAMEPLAY LOGIC
+         */
+
+        function spawnEnemy() {
+            // Random angle
+            const angle = Math.random() * Math.PI * 2;
+            // Spawn just outside screen corners (approx)
+            const radius = Math.max(window.innerWidth, window.innerHeight) / 2 + 100;
+            
+            const startX = Math.cos(angle) * radius;
+            const startY = Math.sin(angle) * radius;
+
+            const material = new THREE.SpriteMaterial({ map: enemyTexture });
+            const sprite = new THREE.Sprite(material);
+            
+            sprite.position.set(startX, startY, 0);
+            sprite.scale.set(100, 120, 1); // Size of the head
+
+            // Physics data
+            sprite.userData = {
+                vx: -startX * 0.001, // Simply move towards 0,0
+                vy: -startY * 0.001,
+                active: true
+            };
+
+            scene.add(sprite);
+            enemies.push(sprite);
+        }
+
+        function createFloatingText(text, x, y, type) {
+            // Need to reverse the X coordinate for CSS because the canvas is mirrored via CSS
+            // But UI layer is NOT mirrored.
+            // Wait, actually, the canvas is mirrored with transform scaleX(-1). 
+            // So ThreeJS coordinates (+X is right) visually appear on the Left.
+            // For CSS overlay, we need to map ThreeJS world coord to Screen Coord.
+            
+            // Screen mapping from ThreeJS Ortho Camera
+            const screenX = (x + window.innerWidth / 2);
+            const screenY = (window.innerHeight / 2 - y);
+
+            // Since canvas is mirrored, we flip X for CSS placement relative to window width
+            const visualX = window.innerWidth - screenX; 
+
+            const div = document.createElement('div');
+            div.textContent = text;
+            div.className = `float-text ${type}-text`;
+            div.style.left = `${visualX}px`;
+            div.style.top = `${screenY}px`;
+            uiLayer.appendChild(div);
+
+            // Cleanup
+            setTimeout(() => div.remove(), 1000);
+        }
+
+        function updateGame() {
+            // 1. Manage Enemy Spawning
+            while(enemies.length < CONFIG.maxEnemies) {
+                spawnEnemy();
+            }
+
+            // 2. Aim Assist Logic
+            // Convert normalized hand coords to ThreeJS World Coords
+            // Hand x: 0 (left) to 1 (right). In mirrored canvas: 0 is visual right.
+            // ThreeJS x: -width/2 (left) to width/2 (right).
+            
+            // Map MediaPipe (0..1) to ThreeJS World
+            // Note: Canvas is scaleX(-1). 
+            // If MP returns 0.9 (Right side of video), that renders on Right side of Canvas.
+            // ThreeJS coordinate for Right is +Width/2.
+            const targetX = (state.indexTip.x - 0.5) * window.innerWidth;
+            const targetY = -(state.indexTip.y - 0.5) * window.innerHeight;
+
+            let finalAimX = targetX;
+            let finalAimY = targetY;
+            let hasTarget = false;
+            let targetEnemy = null;
+
+            // Find closest enemy for Magnetic Aim
+            let minDist = CONFIG.aimAssistRadius;
+            
+            enemies.forEach(enemy => {
+                const dx = enemy.position.x - targetX;
+                const dy = enemy.position.y - targetY;
+                const dist = Math.sqrt(dx*dx + dy*dy);
+                
+                if (dist < minDist) {
+                    minDist = dist;
+                    targetEnemy = enemy;
+                    hasTarget = true;
+                }
+            });
+
+            if (hasTarget && targetEnemy) {
+                // Snap
+                finalAimX = targetEnemy.position.x;
+                finalAimY = targetEnemy.position.y;
+                crosshair.material.color.setHex(0xff0000); // Red when locked
+            } else {
+                crosshair.material.color.setHex(0x00ff00); // Green normally
+            }
+
+            // 3. Update Crosshair & Laser
+            if (state.handPresent) {
+                crosshair.visible = true;
+                crosshair.position.lerp(new THREE.Vector3(finalAimX, finalAimY, 0), 0.5);
+
+                // Laser start point (bottom center or hand base? Let's do bottom center for stability)
+                const positions = laserLine.geometry.attributes.position.array;
+                positions[0] = 0; // Start X
+                positions[1] = -window.innerHeight/2; // Start Y
+                positions[2] = 0;
+                positions[3] = crosshair.position.x; // End X
+                positions[4] = crosshair.position.y; // End Y
+                positions[5] = 0;
+                laserLine.geometry.attributes.position.needsUpdate = true;
+                laserLine.visible = true;
+            } else {
+                crosshair.visible = false;
+                laserLine.visible = false;
+            }
+
+            // 4. Move Enemies
+            for (let i = enemies.length - 1; i >= 0; i--) {
+                const e = enemies[i];
+                // Move towards center
+                const angleToCenter = Math.atan2(-e.position.y, -e.position.x);
+                e.position.x += Math.cos(angleToCenter) * CONFIG.enemySpeed;
+                e.position.y += Math.sin(angleToCenter) * CONFIG.enemySpeed;
+                
+                // Spin
+                e.material.rotation += 0.05;
+
+                // Check bounds (if they hit center) - for now just respawn if too close
+                if (e.position.length() < 50) {
+                    scene.remove(e);
+                    enemies.splice(i, 1);
+                }
+            }
+
+            // 5. Handle Shooting
+            if (state.isTriggering) {
+                // Debounce
+                const now = Date.now();
+                if (now - state.lastShotTime > CONFIG.triggerCooldown) {
+                    state.lastShotTime = now;
+                    playSound('shoot');
+
+                    if (hasTarget && targetEnemy) {
+                        // HIT!
+                        playSound('hit');
+                        createFloatingText("HIT!", targetEnemy.position.x, targetEnemy.position.y, "hit");
+                        
+                        // Destroy Enemy
+                        scene.remove(targetEnemy);
+                        const idx = enemies.indexOf(targetEnemy);
+                        if (idx > -1) enemies.splice(idx, 1);
+                        
+                        // Recoil effect on crosshair
+                        crosshair.scale.set(1.5, 1.5, 1);
+                    } else {
+                        // MISS
+                        createFloatingText("MISS", finalAimX, finalAimY, "miss");
+                    }
+                }
+            }
+
+            // Reset effects
+            crosshair.scale.lerp(new THREE.Vector3(1,1,1), 0.1);
+
+            document.getElementById('enemy_stat').innerText = enemies.length;
+        }
+
+        // Render Loop
+        function animate() {
+            requestAnimationFrame(animate);
+            updateGame();
+            renderer.render(scene, camera);
+        }
+        animate();
+
+        /**
+         * MEDIAPIPE HANDS SETUP
+         * CRITICAL: Strict version lock and error handling
+         */
+        
+        function onResults(results) {
+            // Remove loading screen on first successful frame
+            if (state.isLoading) {
+                state.isLoading = false;
+                loadingScreen.style.opacity = 0;
+                setTimeout(() => loadingScreen.style.display = 'none', 500);
+            }
+
+            if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
+                state.handPresent = true;
+                const landmarks = results.multiHandLandmarks[0];
+
+                // Landmark 8: Index Tip
+                state.indexTip.x = landmarks[8].x;
+                state.indexTip.y = landmarks[8].y;
+
+                // Gesture Detection: PISTOL
+                // Trigger logic: Distance between Thumb Tip (4) and Index MCP (5) or Middle MCP (9)
+                // When thumb curls down, tip gets closer to palm/knuckles.
+                const thumbTip = landmarks[4];
+                const indexMCP = landmarks[5]; // Knuckle
+                const middleMCP = landmarks[9];
+
+                // Calculate distance 
+                const dx = thumbTip.x - indexMCP.x;
+                const dy = thumbTip.y - indexMCP.y;
+                const dz = thumbTip.z - indexMCP.z; // Depth matters too
+                const dist = Math.sqrt(dx*dx + dy*dy + dz*dz);
+
+                // Thresholding requires some trial & error based on hand size
+                // Usually < 0.06 is a "closed" pinch/curl state in normalized coords
+                const isTriggerPulled = dist < 0.08;
+
+                state.isTriggering = isTriggerPulled;
+                
+                debugStat.innerText = isTriggerPulled ? "FIRE!" : "Aiming";
+                debugStat.style.color = isTriggerPulled ? "red" : "lime";
+
+            } else {
+                state.handPresent = false;
+                debugStat.innerText = "No Hand";
+                debugStat.style.color = "white";
+            }
+        }
+
+        const hands = new Hands({locateFile: (file) => {
+            // PINNED VERSION to prevent crash
+            return `https://unpkg.com/@mediapipe/hands@${CONFIG.mpVersion}/${file}`;
+        }});
+
+        hands.setOptions({
+            maxNumHands: 1,
+            modelComplexity: 1,
+            minDetectionConfidence: 0.5,
+            minTrackingConfidence: 0.5
+        });
+
+        hands.onResults(onResults);
+
+        // Safe Camera Loop
+        const cameraUtils = new Camera(videoElement, {
+            onFrame: async () => {
+                try {
+                    // Send frame to MediaPipe
+                    // We wrap this to ensure if WASM chokes, game logic continues
+                    await hands.send({image: videoElement});
+                } catch (e) {
+                    console.error("MediaPipe Error:", e);
+                }
+            },
+            width: 1280,
+            height: 720
+        });
+
+        // Start Camera
+        cameraUtils.start().then(() => {
+            console.log("Camera started");
+        }).catch(err => {
+            console.error("Camera failed", err);
+            document.getElementById('loading_text').innerText = "CAMERA ERROR: Check Permissions";
+        });
+
+    </script>
+</body>
+</html>
